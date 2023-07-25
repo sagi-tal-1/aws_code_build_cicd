@@ -1,0 +1,157 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: Creates a CodeBuild project to sync containers from DockerHub
+
+Parameters:
+
+  ImageRepoName:
+    Description: 'Target Image Repo, this name should be identical to the one hosted on DockerHub'
+    Type: String
+    Default: 'hashicorp/terraform'
+
+  ImageTagCount:
+    Description: 'The number of tags to keep updated, simple head from curl output to query tags on DockerHub'
+    Type: Number
+    Default: 2
+
+Resources:
+  Repository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref ImageRepoName
+      ImageScanningConfiguration:
+        ScanOnPush: true
+
+  CodeBuild:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join
+        - '-'
+        - - !Ref 'AWS::StackName'
+          - CodeBuild
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          -
+            Action: 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+      Policies:
+        - PolicyName: ECR
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:CompleteLayerUpload
+                  - ecr:GetAuthorizationToken
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Effect: Allow
+                Resource: '*'
+        - PolicyName: LogGroup
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Effect: Allow
+                Resource: !Sub 'arn:aws:logs:ap-southeast-2:${AWS::AccountId}:log-group:/aws/codebuild/*'
+
+  DockerHubSync:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+
+          phases:
+            pre_build:
+              commands:
+                - echo "Logging in to Amazon ECR..."
+                - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+            build:
+              commands:
+                - echo "Retrieving Docker image tags..."
+                - TAGS=$(curl -L -s https://registry.hub.docker.com/v2/repositories/${IMAGE_REPO_NAME}/tags | jq '."results"[]["name"]' | head -n${IMAGE_TAG_COUNT} | sed s'/"//g')
+                - for TAG in $TAGS; do docker pull $IMAGE_REPO_NAME:$TAG;done
+                - for TAG in $TAGS; do docker tag $IMAGE_REPO_NAME:$TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:$TAG;done
+            post_build:
+              commands:
+                - echo "Pushing image tags to ECR..."
+                - for TAG in $TAGS; do docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:$TAG;done
+      Environment:
+        ComputeType: "BUILD_GENERAL1_SMALL"
+        Image: "aws/codebuild/standard:5.0"
+        Type: "LINUX_CONTAINER"
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Type: PLAINTEXT
+            Value: "ap-southeast-2"
+          - Name: AWS_ACCOUNT_ID
+            Type: PLAINTEXT
+            Value: !Ref AWS::AccountId
+          - Name: IMAGE_TAG_COUNT
+            Type: PLAINTEXT
+            Value: !Ref ImageTagCount
+          - Name: IMAGE_REPO_NAME
+            Type: PLAINTEXT
+            Value: !Ref ImageRepoName
+      Description: !Sub 'Run ${ImageRepoName} image tags repo sync from Dockerhub to local ECR repo'
+      ServiceRole: !GetAtt CodeBuild.Arn
+      TimeoutInMinutes: 300
+
+  LogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/${DockerHubSync}-${ImageRepoName}'
+      RetentionInDays: 3
+
+  EventRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: IAM role to allow Amazon CloudWatch Events to trigger AWS CodeBuild build
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action: codebuild:StartBuild
+                Effect: Allow
+                Resource: !GetAtt 'DockerHubSync.Arn'
+          PolicyName: !Join
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - CloudWatchEventPolicy
+      RoleName: !Join
+        - '-'
+        - - !Ref 'AWS::StackName'
+          - CloudWatchEventRule
+
+  NightlyEvent:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Rule for Amazon CloudWatch Events to trigger a build every night
+      ScheduleExpression: "cron(0 0 * * ? *)"
+      Name: !Join
+        - '-'
+        - - !Ref 'AWS::StackName'
+          - NightlyBuild
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt 'DockerHubSync.Arn'
+          Id: NightlyCheck
+          RoleArn: !GetAtt 'EventRole.Arn'

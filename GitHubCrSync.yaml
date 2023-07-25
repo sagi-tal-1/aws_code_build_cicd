@@ -1,0 +1,180 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: Creates a CodeBuild project to sync containers from GitHub Container Registry
+
+Parameters:
+
+  ImageRepoName:
+    Description: 'Target Image Repo, this name should be identical to the one hosted on GitHub i.e. super-linter/super-linter'
+    Type: String
+
+  GitHubUserName:
+    Description: 'Username of GitHub User'
+    Type: String
+
+  GitHubPat:
+    Description: 'Personal Access Token of GitHub User. Only requires read:packages permission'
+    Type: String
+
+  GitHubCr:
+    Description: 'GitHub Container Registry host. Defaults to ghcr.io'
+    Type: String
+    Default: 'ghcr.io'
+
+Resources:
+  Repository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref ImageRepoName
+      ImageScanningConfiguration:
+        ScanOnPush: true
+
+  CodeBuild:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join
+        - '-'
+        - - !Ref 'AWS::StackName'
+          - CodeBuild
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          -
+            Action: 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+      Policies:
+        - PolicyName: ECR
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:CompleteLayerUpload
+                  - ecr:GetAuthorizationToken
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                  - ecr:ListImages
+                Effect: Allow
+                Resource: '*'
+        - PolicyName: LogGroup
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Effect: Allow
+                Resource: !Sub 'arn:aws:logs:ap-southeast-2:${AWS::AccountId}:log-group:/aws/codebuild/*'
+
+  GitHubCrSync:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+            version: 0.2
+
+            phases:
+              pre_build:
+                commands:
+                  - echo "Logging in to Amazon ECR..."
+                  - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+                  - echo "Logging in to GHCR"
+                  - echo "${GITHUB_PAT}" | docker login "${GITHUB_CR}" --username ${GITHUB_USER} --password-stdin
+              build:
+                commands:
+                  - COLON=$(python -c "print(chr(58))")
+                  - echo "Retrieving Docker image tags..."
+                  - EXISTING_TAGS=$(aws ecr list-images --repository-name "${IMAGE_REPO_NAME}" | jq -r '[.imageIds[].imageTag] | unique | join("\n")')
+                  - echo "The following tags exist already in ECR - $EXISTING_TAGS"
+                  - TOKEN=$(curl -u ${GITHUB_USER}:${GITHUB_PAT} https"${COLON}"//"${GITHUB_CR}"/token\?scope\="repository:${IMAGE_REPO_NAME}:pull" | jq -r .token)
+                  - REMOTE_TAGS=$(curl https"${COLON}"//"${GITHUB_CR}"/v2/"${IMAGE_REPO_NAME}"/tags/list -H 'Authorization'"${COLON}"' Bearer '"${TOKEN}" | jq -r '.tags | sort_by(.) | join("\n")' | sed s'/"//g')
+                  - echo "The following tags exist at the source - $REMOTE_TAGS"
+                  - TAG_LIST=$(echo "${EXISTING_TAGS} ${REMOTE_TAGS}" | tr ' ' '\n' | sort | uniq -u)
+                  - echo "Attempting to sync the following tags - latest $TAG_LIST"
+                  - for TAG in $(echo latest $TAG_LIST); do echo "Syncing Image Tag - ${TAG}"; docker pull "${GITHUB_CR}"/"${IMAGE_REPO_NAME}":"${TAG}";done
+                  - for TAG in $(echo latest $TAG_LIST); do echo "Pushing Image Tag - ${TAG}"; docker tag "${GITHUB_CR}"/"${IMAGE_REPO_NAME}":"${TAG}" $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:$TAG;done
+              post_build:
+                commands:
+                  - echo "Pushing image tags to ECR..."
+                  - for TAG in $(echo latest $TAG_LIST); do docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:$TAG;done
+      Environment:
+        ComputeType: "BUILD_GENERAL1_SMALL"
+        Image: "aws/codebuild/standard:7.0"
+        Type: "LINUX_CONTAINER"
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Type: PLAINTEXT
+            Value: "ap-southeast-2"
+          - Name: AWS_ACCOUNT_ID
+            Type: PLAINTEXT
+            Value: !Ref AWS::AccountId
+          - Name: IMAGE_REPO_NAME
+            Type: PLAINTEXT
+            Value: !Ref ImageRepoName
+          - Name: GITHUB_USER
+            Type: PLAINTEXT
+            Value: !Ref GitHubUserName
+          - Name: GITHUB_PAT
+            Type: PLAINTEXT
+            Value: !Ref GitHubPat
+          - Name: GITHUB_CR
+            Type: PLAINTEXT
+            Value: !Ref GitHubCr
+      Description: !Sub 'Syncs ${ImageRepoName} image tags repo sync from Dockerhub to local ECR repo'
+      ServiceRole: !GetAtt CodeBuild.Arn
+      TimeoutInMinutes: 300
+
+  LogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/${GitHubCrSync}-${ImageRepoName}'
+      RetentionInDays: 3
+
+  EventRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: IAM role to allow Amazon CloudWatch Events to trigger AWS CodeBuild build
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action: codebuild:StartBuild
+                Effect: Allow
+                Resource: !GetAtt 'GitHubCrSync.Arn'
+          PolicyName: !Join
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - CloudWatchEventPolicy
+      RoleName: !Join
+        - '-'
+        - - !Ref 'AWS::StackName'
+          - CloudWatchEventRule
+
+  NightlyEvent:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Rule for Amazon CloudWatch Events to trigger a build every night
+      ScheduleExpression: "cron(0 0 * * ? *)"
+      Name: !Join
+        - '-'
+        - - !Ref 'AWS::StackName'
+          - NightlyBuild
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt 'GitHubCrSync.Arn'
+          Id: NightlyCheck
+          RoleArn: !GetAtt 'EventRole.Arn'
