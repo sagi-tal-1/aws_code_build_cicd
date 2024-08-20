@@ -2,6 +2,6 @@ name: Hello World
 on: [push]
 jobs:
   Hello-World-Job:
-    runs-on: codebuild-cicdtest-${{ github.run_id }}-${{ github.run_attempt }}-aws/codebuild/amazonlinux2-x86_64-standard:5.0
+    runs-on: codebuild-cicdtest-${{ github.run_id }}-${{ github.run_attempt }}-aws/codebuild/amazonlinux2023-x86_64:latest-5.0-small
     steps:
       - run: echo "Hello World!"
